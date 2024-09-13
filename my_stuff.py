@@ -1,92 +1,101 @@
+# Install required packages (uncomment and run if needed)
+# !pip install transformers sklearn pandas numpy torch
+
 import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertModel
 import torch.nn as nn
+import torch.optim as optim
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
-import argparse
+from sklearn.metrics import (
+    f1_score, precision_score, recall_score
+)
+from collections import Counter
 import os
+import copy
+import time
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
 
 # ==========================
-# 1. Data Preparation
+# 1. Data Loading and Preparation
 # ==========================
 
-def load_data(file_path):
-    """
-    Load the dataset from a CSV file.
+# Load your dataset
+# Replace 'policies.csv' with your actual data file path
+data = pd.read_csv('policies.csv')
 
-    Args:
-        file_path (str): Path to the CSV file.
+# Ensure that 'policy_title' and 'policy_summary' are strings
+data['policy_title'] = data['policy_title'].astype(str)
+data['policy_summary'] = data['policy_summary'].astype(str)
 
-    Returns:
-        pd.DataFrame: Loaded DataFrame.
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"The file {file_path} does not exist.")
-    data = pd.read_csv(file_path)
-    if 'policy_title' not in data.columns or 'policy_summary' not in data.columns:
-        raise ValueError("CSV must contain 'policy_title' and 'policy_summary' columns.")
-    # Combine policy title and summary into a single text field
-    data['text'] = data['policy_title'].astype(str) + " " + data['policy_summary'].astype(str)
-    return data
+# Combine 'policy_title' and 'policy_summary' into one text column
+data['text'] = data['policy_title'] + ' ' + data['policy_summary']
 
-def encode_labels(data, num_departments=12):
-    """
-    Encode department labels from the DataFrame.
+# Extract department labels (assuming columns are named 'dept_1' to 'dept_12')
+num_departments = 12
+label_cols = [f'dept_{i}' for i in range(1, num_departments + 1)]
 
-    Args:
-        data (pd.DataFrame): DataFrame containing department labels.
-        num_departments (int): Number of departments.
+# Check if all label columns exist
+for col in label_cols:
+    if col not in data.columns:
+        raise ValueError(f"Column {col} not found in the dataset.")
 
-    Returns:
-        np.ndarray: Encoded labels.
-    """
-    label_cols = [f'dept_{i}' for i in range(1, num_departments + 1)]
-    for col in label_cols:
-        if col not in data.columns:
-            raise ValueError(f"Missing column: {col} in the dataset.")
-    labels = data[label_cols].values
-    return labels, label_cols
+# Extract labels
+labels = data[label_cols].values
 
-def split_data(texts, labels, test_size=0.2, random_state=42):
-    """
-    Split the data into training and validation sets.
-
-    Args:
-        texts (list): List of text data.
-        labels (np.ndarray): Array of labels.
-        test_size (float): Proportion of the dataset to include in the validation split.
-        random_state (int): Random seed.
-
-    Returns:
-        Tuple: Train and validation texts and labels.
-    """
-    return train_test_split(
-        texts,
-        labels,
-        test_size=test_size,
-        random_state=random_state
-    )
+# Split data into training and validation sets
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    data['text'].tolist(),
+    labels,
+    test_size=0.2,
+    random_state=42
+)
 
 # ==========================
-# 2. BERT Embedding Extraction
+# 2. Handling Imbalanced Data
 # ==========================
 
+# Compute initial class weights based on training data
+def compute_class_weights(labels):
+    # labels: numpy array of shape (num_samples, num_classes)
+    class_weights = []
+    for i in range(labels.shape[1]):
+        class_counts = Counter(labels[:, i])
+        neg_count = class_counts.get(0, 0)
+        pos_count = class_counts.get(1, 0)
+        # Avoid division by zero
+        if pos_count == 0:
+            pos_count = 1
+        weight = neg_count / pos_count
+        class_weights.append(weight)
+    return torch.FloatTensor(class_weights)
+
+initial_class_weights = compute_class_weights(train_labels)
+print("Initial Class Weights:", initial_class_weights)
+
+# ==========================
+# 3. Dataset and DataLoader
+# ==========================
+
+# Initialize BERT tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+# Define custom dataset
 class PolicyDataset(Dataset):
-    """
-    Custom Dataset for Policy data.
-    """
-    def __init__(self, texts, labels, tokenizer, max_length=512):
+    def __init__(self, texts, labels=None, tokenizer=None, max_length=512):
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
-
+        
     def __len__(self):
         return len(self.texts)
-
+    
     def __getitem__(self, idx):
         encoding = self.tokenizer.encode_plus(
             self.texts[idx],
@@ -97,289 +106,293 @@ class PolicyDataset(Dataset):
             return_attention_mask=True,
             return_tensors='pt'
         )
-        input_ids = encoding['input_ids'].squeeze()  # Shape: (max_length)
-        attention_mask = encoding['attention_mask'].squeeze()  # Shape: (max_length)
-        labels = torch.FloatTensor(self.labels[idx])  # Shape: (num_departments)
-
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
+        
+        item = {
+            'input_ids': encoding['input_ids'].flatten(),  # Shape: (max_length)
+            'attention_mask': encoding['attention_mask'].flatten(),  # Shape: (max_length)
         }
+        
+        if self.labels is not None:
+            item['labels'] = torch.FloatTensor(self.labels[idx])  # Shape: (num_departments)
+        
+        return item
+
+# Create datasets
+train_dataset = PolicyDataset(train_texts, train_labels, tokenizer)
+val_dataset = PolicyDataset(val_texts, val_labels, tokenizer)
+
+# Create dataloaders
+batch_size = 8  # Adjust based on your GPU memory
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
 # ==========================
-# 3. Neural Network Construction
+# 4. Model Definition
 # ==========================
 
+# Define the classifier model
 class PolicyClassifier(nn.Module):
-    """
-    Neural Network Model for Policy Classification.
-    """
-    def __init__(self, bert_model, dropout=0.3, num_classes=12):
+    def __init__(self, num_classes=12, dropout=0.3):
         super(PolicyClassifier, self).__init__()
-        self.bert = bert_model
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(self.bert.config.hidden_size, num_classes)
-
-    # def forward(self, input_ids, attention_mask):
-    #     outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-    #     cls_output = outputs.last_hidden_state[:, 0, :]
-    #     x = self.dropout(cls_output)
-    #     logits = self.classifier(x)
-    #     return logits
-
+        
     def forward(self, input_ids, attention_mask):
-        # If you want to fine-tune BERT, remove the following line
-        with torch.no_grad():
-            outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            cls_output = outputs.last_hidden_state[:, 0, :]  # [CLS] token
-
+        # Get the outputs from BERT
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        # Extract the [CLS] token embeddings
+        cls_output = outputs.last_hidden_state[:, 0, :]  # Shape: (batch_size, hidden_size)
         x = self.dropout(cls_output)
-        logits = self.classifier(x)
+        logits = self.classifier(x)  # Shape: (batch_size, num_classes)
         return logits
 
-
-
-
-
-# ==========================
-# 4. Training and Evaluation Functions
-# ==========================
-
-def train_epoch(model, data_loader, criterion, optimizer, device):
-    """
-    Train the model for one epoch.
-
-    Args:
-        model (nn.Module): The model to train.
-        data_loader (DataLoader): Training data loader.
-        criterion (nn.Module): Loss function.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        device (torch.device): Device to run the training on.
-
-    Returns:
-        float: Average loss for the epoch.
-    """
-    model.train()
-    epoch_loss = 0
-
-    for batch in data_loader:
-        optimizer.zero_grad()
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
-
-        outputs = model(input_ids, attention_mask)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        epoch_loss += loss.item()
-
-    return epoch_loss / len(data_loader)
-
-def eval_model(model, data_loader, criterion, device):
-    """
-    Evaluate the model on the validation set.
-
-    Args:
-        model (nn.Module): The model to evaluate.
-        data_loader (DataLoader): Validation data loader.
-        criterion (nn.Module): Loss function.
-        device (torch.device): Device to run the evaluation on.
-
-    Returns:
-        Tuple: Average loss, accuracy, precision, recall, and F1-score.
-    """
-    model.eval()
-    epoch_loss = 0
-    preds = []
-    true_labels = []
-
-    with torch.no_grad():
-        for batch in data_loader:
+# Function to train and evaluate the model
+def train_and_evaluate(model, criterion, optimizer, train_loader, val_loader, device, epochs=3):
+    best_model = None
+    best_macro_f1 = 0
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-
-            outputs = model(input_ids, attention_mask)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             loss = criterion(outputs, labels)
-            epoch_loss += loss.item()
-
-            preds.append(torch.sigmoid(outputs).cpu().numpy())
-            true_labels.append(labels.cpu().numpy())
-
-    preds = np.vstack(preds)
-    true_labels = np.vstack(true_labels)
-    preds_binary = (preds >= 0.5).astype(int)
-
-    accuracy = accuracy_score(true_labels, preds_binary)
-    precision = precision_score(true_labels, preds_binary, average='micro', zero_division=0)
-    recall = recall_score(true_labels, preds_binary, average='micro', zero_division=0)
-    f1 = f1_score(true_labels, preds_binary, average='micro', zero_division=0)
-
-    return epoch_loss / len(data_loader), accuracy, precision, recall, f1
-
-# ==========================
-# 5. Inference Function
-# ==========================
-
-def predict(model, tokenizer, text, device, threshold=0.5, max_length=512):
-    """
-    Make a prediction on a single text input.
-
-    Args:
-        model (nn.Module): The trained model.
-        tokenizer (BertTokenizer): BERT tokenizer.
-        text (str): The input text.
-        device (torch.device): Device to run the inference on.
-        threshold (float): Threshold for classification.
-        max_length (int): Maximum sequence length.
-
-    Returns:
-        Tuple: Binary predictions and probabilities for each class.
-    """
-    encoding = tokenizer.encode_plus(
-        text,
-        add_special_tokens=True,
-        max_length=max_length,
-        padding='max_length',
-        truncation=True,
-        return_attention_mask=True,
-        return_tensors='pt'
-    )
-
-    input_ids = encoding['input_ids'].to(device)
-    attention_mask = encoding['attention_mask'].to(device)
-
-    model.eval()
-    with torch.no_grad():
-        outputs = model(input_ids, attention_mask)
-        probs = torch.sigmoid(outputs).cpu().numpy()[0]
-
-    preds = (probs >= threshold).astype(int)
-    return preds, probs
-
-# ==========================
-# 6. Main Training Loop
-# ==========================
-
-def main(args):
-    # Check device
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    print(f"Using device: {device}")
-
-    # Load data
-    print("Loading data...")
-    data = load_data(args.data_path)
-    labels, label_cols = encode_labels(data, num_departments=12)
-    train_texts, val_texts, train_labels, val_labels = split_data(
-        data['text'].tolist(),
-        labels,
-        test_size=0.2,
-        random_state=42
-    )
-
-    # Initialize tokenizer and BERT model
-    print("Initializing BERT tokenizer and model...")
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    bert_model = BertModel.from_pretrained('bert-base-uncased')
-    bert_model.to(device)
-    bert_model.eval()  # Set BERT to evaluation mode
-
-    # Create datasets and dataloaders
-    print("Creating datasets and dataloaders...")
-    train_dataset = PolicyDataset(train_texts, train_labels, tokenizer, max_length=512)
-    val_dataset = PolicyDataset(val_texts, val_labels, tokenizer, max_length=512)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
-
-    # Initialize the model
-    print("Initializing the classifier model...")
-    model = PolicyClassifier(bert_model, dropout=0.3, num_classes=12)
-    model = model.to(device)
-
-    # Define loss function and optimizer
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-
-    # Training loop
-    print("Starting training...")
-    best_f1 = 0
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_accuracy, val_precision, val_recall, val_f1 = eval_model(model, val_loader, criterion, device)
-
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.4f} | Val Precision: {val_precision:.4f} | Val Recall: {val_recall:.4f} | Val F1: {val_f1:.4f}")
-
-        # Save the model if F1 improves
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            torch.save(model.state_dict(), args.save_path)
-            print(f"Model saved to {args.save_path} (F1 improved to {best_f1:.4f})")
-
-    print("\nTraining complete!")
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_train_loss = total_loss / len(train_loader)
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                
+                preds = torch.sigmoid(outputs)
+                all_preds.append(preds.cpu())
+                all_labels.append(labels.cpu())
+        
+        avg_val_loss = val_loss / len(val_loader)
+        all_preds = torch.cat(all_preds)
+        all_labels = torch.cat(all_labels)
+        preds_binary = (all_preds >= 0.5).int()
+        
+        # Calculate overall macro F1-score
+        macro_f1 = f1_score(
+            all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
+        )
+        
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Train Loss: {avg_train_loss:.4f}")
+        print(f"Validation Loss: {avg_val_loss:.4f}")
+        print(f"Macro F1 Score: {macro_f1:.4f}")
+        print("-" * 50)
+        
+        # Save the best model based on macro F1-score
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            best_model = copy.deepcopy(model.state_dict())
     
-
-    # Example inference (optional)
-    if args.example_text:
-        print("\nPerforming example prediction...")
-        preds, probs = predict(model, tokenizer, args.example_text, device)
-        for idx, (pred, prob) in enumerate(zip(preds, probs), start=1):
-            print(f"Department {idx}: {'Applicable' if pred else 'Not Applicable'} (Probability: {prob:.4f})")
-
-model = PolicyClassifier(bert_model, dropout=0.3, num_classes=12)
-model.load_state_dict(torch.load('models/policy_classifier.pt'))
-model.to(device)
-model.eval()
-
+    return best_model, best_macro_f1
 
 # ==========================
-# 7. Entry Point
+# 5. Grid Search over Scaling Factors
 # ==========================
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BERT-based Multi-label Policy Classifier")
+# Define scaling factors to apply to the initial class weights
+scaling_factors = [0.5, 1.0, 2.0, 5.0]
 
-    parser.add_argument(
-        '--data_path',
-        type=str,
-        required=True,
-        help='Path to the CSV file containing the dataset.'
-    )
-    parser.add_argument(
-        '--save_path',
-        type=str,
-        default='policy_classifier.pt',
-        help='Path to save the trained model.'
-    )
-    parser.add_argument(
-        '--epochs',
-        type=int,
-        default=5,
-        help='Number of training epochs.'
-    )
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=16,
-        help='Batch size for training and evaluation.'
-    )
-    parser.add_argument(
-        '--learning_rate',
-        type=float,
-        default=2e-5,
-        help='Learning rate for the optimizer.'
-    )
-    parser.add_argument(
-        '--example_text',
-        type=str,
-        default=None,
-        help='Example text for making a prediction after training.'
-    )
+# Store results for each scaling factor
+grid_search_results = []
 
-    args = parser.parse_args()
-    main(args)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+for scale in scaling_factors:
+    print(f"Grid Search - Scaling Factor: {scale}")
+    # Scale the class weights
+    scaled_class_weights = initial_class_weights * scale
+    
+    # Define loss function with scaled class weights
+    criterion = nn.BCEWithLogitsLoss(pos_weight=scaled_class_weights.to(device))
+    
+    # Initialize the model
+    model = PolicyClassifier(num_classes=num_departments)
+    model = model.to(device)
+    
+    # Define optimizer
+    optimizer = optim.Adam(model.parameters(), lr=2e-5)
+    
+    # Train and evaluate the model
+    start_time = time.time()
+    best_model_state, best_macro_f1 = train_and_evaluate(
+        model, criterion, optimizer, train_loader, val_loader, device, epochs=3
+    )
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    # Store the results
+    grid_search_results.append({
+        'scaling_factor': scale,
+        'best_macro_f1': best_macro_f1,
+        'training_time': elapsed_time,
+        'best_model_state': best_model_state  # Save the best model state
+    })
+    print(f"Scaling Factor {scale} - Best Macro F1: {best_macro_f1:.4f}")
+    print(f"Training Time: {elapsed_time/60:.2f} minutes")
+    print("=" * 60)
+
+# Find the scaling factor with the best macro F1-score
+best_result = max(grid_search_results, key=lambda x: x['best_macro_f1'])
+optimal_scaling_factor = best_result['scaling_factor']
+best_macro_f1 = best_result['best_macro_f1']
+best_model_state = best_result['best_model_state']
+
+print(f"Optimal Scaling Factor: {optimal_scaling_factor}")
+print(f"Best Macro F1 Score: {best_macro_f1:.4f}")
+
+# Load the best model state
+final_model = PolicyClassifier(num_classes=num_departments)
+final_model.load_state_dict(best_model_state)
+final_model = final_model.to(device)
+final_model.eval()
+
+# ==========================
+# 6. Saving the Final Model and Tokenizer
+# ==========================
+
+# Create directory to save model and tokenizer
+model_dir = 'policy_classifier_model'
+if not os.path.exists(model_dir):
+    os.makedirs(model_dir)
+
+# Save the final model
+model_save_path = os.path.join(model_dir, 'model.pt')
+torch.save(final_model.state_dict(), model_save_path)
+
+# Save tokenizer
+tokenizer_save_path = os.path.join(model_dir, 'tokenizer')
+tokenizer.save_pretrained(tokenizer_save_path)
+
+print("Final model and tokenizer saved.")
+
+# ==========================
+# 7. Inference on New Data
+# ==========================
+
+# Load tokenizer
+loaded_tokenizer = BertTokenizer.from_pretrained(tokenizer_save_path)
+
+# Load classifier model
+loaded_model = PolicyClassifier(num_classes=num_departments)
+loaded_model.load_state_dict(torch.load(model_save_path))
+loaded_model = loaded_model.to(device)
+loaded_model.eval()
+
+print("Model and tokenizer loaded for inference.")
+
+# Assume you have a new DataFrame with 'policy_id', 'policy_title', 'policy_summary'
+# Replace 'new_policies.csv' with your actual new data file path
+new_policies = pd.read_csv('new_policies.csv')
+
+# Ensure 'policy_id', 'policy_title', 'policy_summary' exist
+required_cols = ['policy_id', 'policy_title', 'policy_summary']
+for col in required_cols:
+    if col not in new_policies.columns:
+        raise ValueError(f"Column {col} not found in new policies dataset.")
+
+# Ensure 'policy_title' and 'policy_summary' are strings
+new_policies['policy_title'] = new_policies['policy_title'].astype(str)
+new_policies['policy_summary'] = new_policies['policy_summary'].astype(str)
+
+# Combine 'policy_title' and 'policy_summary' into one text column
+new_policies['text'] = new_policies['policy_title'] + ' ' + new_policies['policy_summary']
+
+# Define function for making predictions
+def predict_applicability(model, tokenizer, texts, device, threshold=0.5, batch_size=8):
+    model.eval()
+    predictions = []
+    probabilities = []
+    
+    dataset = PolicyDataset(texts, labels=None, tokenizer=tokenizer)
+    dataloader = DataLoader(dataset, batch_size=batch_size)
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            probs = torch.sigmoid(outputs)
+            
+            preds = (probs >= threshold).int()
+            
+            predictions.extend(preds.cpu().numpy())
+            probabilities.extend(probs.cpu().numpy())
+    
+    return predictions, probabilities
+
+# Get texts and IDs for prediction
+texts = new_policies['text'].tolist()
+policy_ids = new_policies['policy_id'].tolist()
+policy_titles = new_policies['policy_title'].tolist()
+policy_summaries = new_policies['policy_summary'].tolist()
+
+# Make predictions
+predictions, probabilities = predict_applicability(
+    model=loaded_model,
+    tokenizer=loaded_tokenizer,
+    texts=texts,
+    device=device
+)
+
+# Convert predictions and probabilities to DataFrame
+predictions_df = pd.DataFrame(predictions, columns=label_cols)
+probabilities_df = pd.DataFrame(probabilities, columns=[f'{col}_prob' for col in label_cols])
+
+# Map predictions to Yes/No
+for col in label_cols:
+    predictions_df[col] = predictions_df[col].map({1: 'Yes', 0: 'No'})
+
+# Combine results into a single DataFrame
+results = pd.DataFrame({
+    'policy_id': policy_ids,
+    'policy_title': policy_titles,
+    'policy_summary': policy_summaries
+})
+
+results = pd.concat([results, predictions_df, probabilities_df], axis=1)
+
+# Rearrange columns for clarity
+cols = ['policy_id', 'policy_title', 'policy_summary']
+for col in label_cols:
+    cols.append(col)
+    cols.append(f'{col}_prob')
+results = results[cols]
+
+# Display the results
+print(results.head())
+
+# Save results to a CSV file
+results.to_csv('policy_predictions.csv', index=False)
+print("Predictions saved to 'policy_predictions.csv'.")
