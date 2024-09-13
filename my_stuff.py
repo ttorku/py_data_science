@@ -322,6 +322,7 @@ def main(args):
             print(f"Model saved to {args.save_path} (F1 improved to {best_f1:.4f})")
 
     print("\nTraining complete!")
+    
 
     # Example inference (optional)
     if args.example_text:
@@ -329,6 +330,12 @@ def main(args):
         preds, probs = predict(model, tokenizer, args.example_text, device)
         for idx, (pred, prob) in enumerate(zip(preds, probs), start=1):
             print(f"Department {idx}: {'Applicable' if pred else 'Not Applicable'} (Probability: {prob:.4f})")
+
+model = PolicyClassifier(bert_model, dropout=0.3, num_classes=12)
+model.load_state_dict(torch.load('models/policy_classifier.pt'))
+model.to(device)
+model.eval()
+
 
 # ==========================
 # 7. Entry Point
