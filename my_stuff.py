@@ -121,12 +121,12 @@ class PolicyClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(self.bert.config.hidden_size, num_classes)
 
-    def forward(self, input_ids, attention_mask):
-    outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-    cls_output = outputs.last_hidden_state[:, 0, :]
-    x = self.dropout(cls_output)
-    logits = self.classifier(x)
-    return logits
+    # def forward(self, input_ids, attention_mask):
+    #     outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+    #     cls_output = outputs.last_hidden_state[:, 0, :]
+    #     x = self.dropout(cls_output)
+    #     logits = self.classifier(x)
+    #     return logits
 
     def forward(self, input_ids, attention_mask):
         # If you want to fine-tune BERT, remove the following line
