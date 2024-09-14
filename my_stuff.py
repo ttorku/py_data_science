@@ -203,6 +203,69 @@ def train_and_evaluate(model, criterion, optimizer, train_loader, val_loader, de
             all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
         )
         
+        # ==========================
+        # Calculate Per-Department Metrics and Save to TXT
+        # ==========================
+        per_dept_metrics = []
+        with open(f'validation_metrics_epoch_{epoch+1}.txt', 'w') as f:
+            f.write(f"Epoch {epoch+1}/{epochs}\n")
+            f.write(f"Train Loss: {avg_train_loss:.4f}\n")
+            f.write(f"Validation Loss: {avg_val_loss:.4f}\n\n")
+            f.write("Per-Department Metrics:\n")
+            f.write("Department\tPrecision\tRecall\tF1-Score\tSupport\n")
+            
+            for i in range(num_departments):
+                dept_name = label_cols[i]
+                y_true = all_labels[:, i].numpy()
+                y_pred = preds_binary[:, i].numpy()
+                
+                precision = precision_score(y_true, y_pred, zero_division=0)
+                recall = recall_score(y_true, y_pred, zero_division=0)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+                support = int(y_true.sum())
+                
+                per_dept_metrics.append({
+                    'department': dept_name,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1_score': f1,
+                    'support': support
+                })
+                
+                # Write to file
+                f.write(f"{dept_name}\t{precision:.4f}\t{recall:.4f}\t{f1:.4f}\t{support}\n")
+            
+            # Overall Metrics
+            micro_precision = precision_score(
+                all_labels.numpy(), preds_binary.numpy(), average='micro', zero_division=0
+            )
+            micro_recall = recall_score(
+                all_labels.numpy(), preds_binary.numpy(), average='micro', zero_division=0
+            )
+            micro_f1 = f1_score(
+                all_labels.numpy(), preds_binary.numpy(), average='micro', zero_division=0
+            )
+            
+            macro_precision = precision_score(
+                all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
+            )
+            macro_recall = recall_score(
+                all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
+            )
+            macro_f1 = f1_score(
+                all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
+            )
+            
+            f.write("\nOverall Metrics:\n")
+            f.write(f"Micro Precision: {micro_precision:.4f}\n")
+            f.write(f"Micro Recall: {micro_recall:.4f}\n")
+            f.write(f"Micro F1 Score: {micro_f1:.4f}\n")
+            f.write(f"Macro Precision: {macro_precision:.4f}\n")
+            f.write(f"Macro Recall: {macro_recall:.4f}\n")
+            f.write(f"Macro F1 Score: {macro_f1:.4f}\n")
+        
+        print(f"Validation metrics saved to 'validation_metrics_epoch_{epoch+1}.txt'")
+        
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"Train Loss: {avg_train_loss:.4f}")
         print(f"Validation Loss: {avg_val_loss:.4f}")
@@ -393,6 +456,16 @@ results = results[cols]
 # Display the results
 print(results.head())
 
-# Save results to a CSV file
-results.to_csv('policy_predictions.csv', index=False)
-print("Predictions saved to 'policy_predictions.csv'.")
+# Save results to a TXT file with the desired format
+with open('policy_predictions.txt', 'w') as f:
+    for idx, row in results.iterrows():
+        f.write(f"Policy ID: {row['policy_id']}\n")
+        f.write(f"Title: {row['policy_title']}\n")
+        f.write(f"Summary: {row['policy_summary']}\n")
+        for col in label_cols:
+            prediction = row[col]
+            probability = row[f'{col}_prob']
+            f.write(f"{col}: {prediction} ({probability:.2f})\n")
+        f.write("\n")
+
+print("Predictions saved to 'policy_predictions.txt'.")
