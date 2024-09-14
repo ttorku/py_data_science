@@ -154,6 +154,7 @@ class PolicyClassifier(nn.Module):
 def train_and_evaluate(model, criterion, optimizer, train_loader, val_loader, device, epochs=3):
     best_model = None
     best_macro_f1 = 0
+    last_epoch_metrics = None  # To store metrics of the last epoch
     for epoch in range(epochs):
         model.train()
         total_loss = 0
@@ -203,69 +204,6 @@ def train_and_evaluate(model, criterion, optimizer, train_loader, val_loader, de
             all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
         )
         
-        # ==========================
-        # Calculate Per-Department Metrics and Save to TXT
-        # ==========================
-        per_dept_metrics = []
-        with open(f'validation_metrics_epoch_{epoch+1}.txt', 'w') as f:
-            f.write(f"Epoch {epoch+1}/{epochs}\n")
-            f.write(f"Train Loss: {avg_train_loss:.4f}\n")
-            f.write(f"Validation Loss: {avg_val_loss:.4f}\n\n")
-            f.write("Per-Department Metrics:\n")
-            f.write("Department\tPrecision\tRecall\tF1-Score\tSupport\n")
-            
-            for i in range(num_departments):
-                dept_name = label_cols[i]
-                y_true = all_labels[:, i].numpy()
-                y_pred = preds_binary[:, i].numpy()
-                
-                precision = precision_score(y_true, y_pred, zero_division=0)
-                recall = recall_score(y_true, y_pred, zero_division=0)
-                f1 = f1_score(y_true, y_pred, zero_division=0)
-                support = int(y_true.sum())
-                
-                per_dept_metrics.append({
-                    'department': dept_name,
-                    'precision': precision,
-                    'recall': recall,
-                    'f1_score': f1,
-                    'support': support
-                })
-                
-                # Write to file
-                f.write(f"{dept_name}\t{precision:.4f}\t{recall:.4f}\t{f1:.4f}\t{support}\n")
-            
-            # Overall Metrics
-            micro_precision = precision_score(
-                all_labels.numpy(), preds_binary.numpy(), average='micro', zero_division=0
-            )
-            micro_recall = recall_score(
-                all_labels.numpy(), preds_binary.numpy(), average='micro', zero_division=0
-            )
-            micro_f1 = f1_score(
-                all_labels.numpy(), preds_binary.numpy(), average='micro', zero_division=0
-            )
-            
-            macro_precision = precision_score(
-                all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
-            )
-            macro_recall = recall_score(
-                all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
-            )
-            macro_f1 = f1_score(
-                all_labels.numpy(), preds_binary.numpy(), average='macro', zero_division=0
-            )
-            
-            f.write("\nOverall Metrics:\n")
-            f.write(f"Micro Precision: {micro_precision:.4f}\n")
-            f.write(f"Micro Recall: {micro_recall:.4f}\n")
-            f.write(f"Micro F1 Score: {micro_f1:.4f}\n")
-            f.write(f"Macro Precision: {macro_precision:.4f}\n")
-            f.write(f"Macro Recall: {macro_recall:.4f}\n")
-            f.write(f"Macro F1 Score: {macro_f1:.4f}\n")
-        
-        print(f"Validation metrics saved to 'validation_metrics_epoch_{epoch+1}.txt'")
-        
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"Train Loss: {avg_train_loss:.4f}")
         print(f"Validation Loss: {avg_val_loss:.4f}")
@@ -276,8 +214,17 @@ def train_and_evaluate(model, criterion, optimizer, train_loader, val_loader, de
         if macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
             best_model = copy.deepcopy(model.state_dict())
+            # Store metrics of the last epoch
+            last_epoch_metrics = {
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'macro_f1': macro_f1,
+                'all_labels': all_labels.numpy(),
+                'preds_binary': preds_binary.numpy()
+            }
     
-    return best_model, best_macro_f1
+    return best_model, best_macro_f1, last_epoch_metrics
 
 # ==========================
 # 5. Grid Search over Scaling Factors
@@ -308,7 +255,7 @@ for scale in scaling_factors:
     
     # Train and evaluate the model
     start_time = time.time()
-    best_model_state, best_macro_f1 = train_and_evaluate(
+    best_model_state, best_macro_f1, last_epoch_metrics = train_and_evaluate(
         model, criterion, optimizer, train_loader, val_loader, device, epochs=3
     )
     end_time = time.time()
@@ -319,7 +266,8 @@ for scale in scaling_factors:
         'scaling_factor': scale,
         'best_macro_f1': best_macro_f1,
         'training_time': elapsed_time,
-        'best_model_state': best_model_state  # Save the best model state
+        'best_model_state': best_model_state,  # Save the best model state
+        'last_epoch_metrics': last_epoch_metrics  # Save metrics from the last epoch
     })
     print(f"Scaling Factor {scale} - Best Macro F1: {best_macro_f1:.4f}")
     print(f"Training Time: {elapsed_time/60:.2f} minutes")
@@ -330,9 +278,83 @@ best_result = max(grid_search_results, key=lambda x: x['best_macro_f1'])
 optimal_scaling_factor = best_result['scaling_factor']
 best_macro_f1 = best_result['best_macro_f1']
 best_model_state = best_result['best_model_state']
+best_last_epoch_metrics = best_result['last_epoch_metrics']
 
 print(f"Optimal Scaling Factor: {optimal_scaling_factor}")
 print(f"Best Macro F1 Score: {best_macro_f1:.4f}")
+
+# ==========================
+# 6. Saving Validation Metrics of the Best Scaling Factor
+# ==========================
+
+# Extract metrics from the last epoch of the best scaling factor
+all_labels = best_last_epoch_metrics['all_labels']
+preds_binary = best_last_epoch_metrics['preds_binary']
+avg_train_loss = best_last_epoch_metrics['train_loss']
+avg_val_loss = best_last_epoch_metrics['val_loss']
+epoch = best_last_epoch_metrics['epoch']
+
+# Calculate per-department metrics
+per_dept_metrics = []
+with open('validation_metrics.txt', 'w') as f:
+    f.write(f"Best Scaling Factor: {optimal_scaling_factor}\n")
+    f.write(f"Epoch {epoch}\n")
+    f.write(f"Train Loss: {avg_train_loss:.4f}\n")
+    f.write(f"Validation Loss: {avg_val_loss:.4f}\n\n")
+    f.write("Per-Department Metrics:\n")
+    f.write("Department\tPrecision\tRecall\tF1-Score\tSupport\n")
+    
+    for i in range(num_departments):
+        dept_name = label_cols[i]
+        y_true = all_labels[:, i]
+        y_pred = preds_binary[:, i]
+        
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        support = int(y_true.sum())
+        
+        per_dept_metrics.append({
+            'department': dept_name,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'support': support
+        })
+        
+        # Write to file
+        f.write(f"{dept_name}\t{precision:.4f}\t{recall:.4f}\t{f1:.4f}\t{support}\n")
+    
+    # Overall Metrics
+    micro_precision = precision_score(
+        all_labels, preds_binary, average='micro', zero_division=0
+    )
+    micro_recall = recall_score(
+        all_labels, preds_binary, average='micro', zero_division=0
+    )
+    micro_f1 = f1_score(
+        all_labels, preds_binary, average='micro', zero_division=0
+    )
+    
+    macro_precision = precision_score(
+        all_labels, preds_binary, average='macro', zero_division=0
+    )
+    macro_recall = recall_score(
+        all_labels, preds_binary, average='macro', zero_division=0
+    )
+    macro_f1 = f1_score(
+        all_labels, preds_binary, average='macro', zero_division=0
+    )
+    
+    f.write("\nOverall Metrics:\n")
+    f.write(f"Micro Precision: {micro_precision:.4f}\n")
+    f.write(f"Micro Recall: {micro_recall:.4f}\n")
+    f.write(f"Micro F1 Score: {micro_f1:.4f}\n")
+    f.write(f"Macro Precision: {macro_precision:.4f}\n")
+    f.write(f"Macro Recall: {macro_recall:.4f}\n")
+    f.write(f"Macro F1 Score: {macro_f1:.4f}\n")
+
+print("Validation metrics of the best scaling factor saved to 'validation_metrics.txt'")
 
 # Load the best model state
 final_model = PolicyClassifier(num_classes=num_departments)
@@ -341,7 +363,7 @@ final_model = final_model.to(device)
 final_model.eval()
 
 # ==========================
-# 6. Saving the Final Model and Tokenizer
+# 7. Saving the Final Model and Tokenizer
 # ==========================
 
 # Create directory to save model and tokenizer
@@ -360,7 +382,7 @@ tokenizer.save_pretrained(tokenizer_save_path)
 print("Final model and tokenizer saved.")
 
 # ==========================
-# 7. Inference on New Data
+# 8. Inference on New Data
 # ==========================
 
 # Load tokenizer
